@@ -12,15 +12,19 @@ jobs:
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
+          # Enable Remote Desktop and relax NLA as requested
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
 
+          # Enable Windows built-in RDP firewall rules
           Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Enable-NetFirewallRule
 
+          # Also allow RDP only from Tailscale CGNAT range
           netsh advfirewall firewall delete rule name="RDP-Tailscale" >$null 2>&1
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
 
+          # Restart RDP service to apply settings
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Fixed Password
@@ -31,6 +35,7 @@ jobs:
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+
           if (-not $existing) {
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           } else {
@@ -39,7 +44,7 @@ jobs:
 
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
-          
+
           "RDP_CREDS=User: RDP | Password: $password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
@@ -52,10 +57,12 @@ jobs:
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = Join-Path $env:TEMP "tailscale.msi"
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
+          # Ensure service is running
           Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
 
       - name: Establish Tailscale Connection
@@ -64,25 +71,30 @@ jobs:
           TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if (-not $env:TS_AUTH_KEY -or $env:TS_AUTH_KEY.Trim() -eq "") {
-            Write-Error "TAILSCALE_AUTH_KEY secret is missing. Create a PREAUTHORIZED key in the Tailscale Admin Console and add it as a repo secret."
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing. Create a PREAUTHORIZED key in Tailscale Admin Console and add it as a repo secret."
             exit 1
           }
           if ($env:TS_AUTH_KEY -notmatch "^tskey-") {
-            Write-Error "TAILSCALE_AUTH_KEY does not look like a Tailscale key (should start with 'tskey-')."
+            Write-Error "TAILSCALE_AUTH_KEY format is wrong (expected to start with 'tskey-')."
             exit 1
           }
 
           $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          $hostname  = "gh-runner-$env:GITHUB_RUN_ID"
+
+          # Clear any stale state, then login
+          & $tailscale logout 2>$null
+          & $tailscale up --reset 2>$null
 
           $UpOut = & $tailscale up --authkey="$env:TS_AUTH_KEY" --hostname="$hostname" --accept-routes=true --accept-dns=true 2>&1
           $UpOut | Write-Host
 
           if ($UpOut -match "invalid key" -or $UpOut -match "not valid") {
-            Write-Error "Invalid or expired Tailscale auth key. Create a PREAUTHORIZED key and update the TAILSCALE_AUTH_KEY secret."
+            Write-Error "Invalid/expired Tailscale key. Generate a PREAUTHORIZED key and update TAILSCALE_AUTH_KEY."
             exit 1
           }
 
+          # Poll for assigned IP, retrying briefly if NeedsLogin
           $maxRetries = 24  # ~2 minutes
           $try = 0
           $tsIP = $null
@@ -91,6 +103,7 @@ jobs:
             $statusJson = & $tailscale status --json 2>$null
             if ($statusJson) {
               $status = $statusJson | ConvertFrom-Json
+
               if ($status.BackendState -eq "NeedsLogin") {
                 if ($try -le 3) {
                   & $tailscale up --authkey="$env:TS_AUTH_KEY" --hostname="$hostname" --accept-routes=true --accept-dns=true 2>$null
@@ -110,9 +123,9 @@ jobs:
           if (-not $tsIP) {
             Write-Error "Tailscale IP not assigned.
             Likely causes:
-            - TAILSCALE_AUTH_KEY is invalid, expired, or NOT PREAUTHORIZED
-            - Tailnet policy requires admin approval for new devices
-            Fix: Create a PREAUTHORIZED auth key and update the secret."
+            - TAILSCALE_AUTH_KEY is invalid/expired or NOT PREAUTHORIZED
+            - Tailnet requires admin approval for new devices
+            Fix: Create a PREAUTHORIZED key (Admin Console → Settings → Keys) and update the secret."
             exit 1
           }
 
