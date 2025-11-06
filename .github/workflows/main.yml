@@ -20,13 +20,13 @@ jobs:
                             -Name "SecurityLayer" -Value 0 -Force
 
           # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           
-          # For testing, allow any incoming connection on port 3389
+          # Allow incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Fixed Password
@@ -36,17 +36,19 @@ jobs:
           Write-Output "::add-mask::$password"
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+
+          $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if (-not $existing) {
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           } else {
-            # If the user already exists, ensure the password is set
             try {
               Set-LocalUser -Name "RDP" -Password $securePass
             } catch {
               # Fallback via net user if Set-LocalUser is restricted
-              net user RDP $password
+              cmd /c "net user RDP $password"
             }
           }
+
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           
@@ -66,31 +68,85 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
+          # Ensure the Tailscale service is running
+          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+
       - name: Establish Tailscale Connection
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
+          if (-not $env:TS_AUTH_KEY -or $env:TS_AUTH_KEY.Trim() -eq "") {
+            Write-Error "TAILSCALE_AUTH_KEY secret is missing. Create a PREAUTHORIZED auth key in Tailscale Admin Console and add it to repo secrets."
+            exit 1
+          }
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          # Attempt to bring up Tailscale
+          & $tailscale up --authkey="$env:TS_AUTH_KEY" --hostname="$hostname" --accept-routes=true --accept-dns=true 2>&1 | Tee-Object -Variable UpOut
+
+          # Quick checks for common failure signals
+          if ($UpOut -match "invalid key" -or $UpOut -match "not valid") {
+            Write-Error "Invalid Tailscale auth key. Regenerate a PREAUTHORIZED key and update the TAILSCALE_AUTH_KEY secret."
+            exit 1
+          }
+
+          # Poll for backend state and an assigned IP
+          $maxRetries = 24   # ~2 minutes
+          $try = 0
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+          while ($try -lt $maxRetries) {
+            $statusJson = & $tailscale status --json 2>$null
+            if (-not $statusJson) {
               Start-Sleep -Seconds 5
-              $retries++
+              $try++
+              continue
+            }
+
+            $status = $statusJson | ConvertFrom-Json
+
+            # If NeedsLogin, retry up a few times (preauthorized key should log in automatically)
+            if ($status.BackendState -eq "NeedsLogin") {
+              if ($try -le 3) {
+                & $tailscale up --authkey="$env:TS_AUTH_KEY" --hostname="$hostname" --accept-routes=true --accept-dns=true 2>$null
+              }
+              Start-Sleep -Seconds 5
+              $try++
+              continue
+            }
+
+            # Extract first IPv4 address
+            $ips = @()
+            if ($status.Self -and $status.Self.TailscaleIPs) {
+              $ips = $status.Self.TailscaleIPs | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
+            }
+
+            if ($ips.Count -gt 0) {
+              $tsIP = $ips[0]
+              break
+            }
+
+            Start-Sleep -Seconds 5
+            $try++
           }
-          
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+            Write-Error "Tailscale IP not assigned.
+            Likely causes:
+            - TAILSCALE_AUTH_KEY is invalid, expired, or not preauthorized
+            - Tailnet policy requires admin approval for new devices
+            Fix: Create a PREAUTHORIZED auth key in Tailscale Admin Console and update the TAILSCALE_AUTH_KEY secret."
+            exit 1
           }
+
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+          Write-Host "Tailscale connected. IP: $tsIP"
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
@@ -106,7 +162,6 @@ jobs:
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
           
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
